@@ -1,14 +1,9 @@
-# CI for C++ / CMake project (gcc and clang)
-# - Matrix builds for gcc and clang
-# - CMake configure / build / ctest
-# - Cache build artifacts and ccache
+name: CI
+
 on:
   push:
-    branches: [ "**" ]
   pull_request:
-    branches: [ "**" ]
-
-name: CI
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,64 +14,61 @@ jobs:
       matrix:
         compiler: [gcc, clang]
         build_type: [Release]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure CMake available
-        uses: lukka/get-cmake@v3
-        with:
-          cmake-version: "latest"
-
-      - name: Install system deps
+      - name: Install toolchain and dependencies
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache ninja-build
+
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang
+            sudo apt-get install -y --no-install-recommends clang
           else
-            sudo apt-get install -y gcc g++
+            sudo apt-get install -y --no-install-recommends gcc g++
           fi
 
-      - name: Configure compiler environment variables
-        run: |
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            echo "CC=clang" >> $GITHUB_ENV
-            echo "CXX=clang++" >> $GITHUB_ENV
-          else
-            echo "CC=gcc" >> $GITHUB_ENV
-            echo "CXX=g++" >> $GITHUB_ENV
-          fi
-          echo "CCACHE_DIR=$(pwd)/.ccache" >> $GITHUB_ENV
-        shell: bash
-
-      - name: Cache build and ccache
+      - name: Restore build cache
         uses: actions/cache@v4
         with:
           path: |
             build
             .ccache
-          key: ${{ runner.os }}-cmake-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt') }}
+          key: ${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-cmake-${{ matrix.compiler }}-${{ matrix.build_type }}-
+            ${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
 
       - name: Configure (CMake)
+        shell: bash
         run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            export CC=clang
+            export CXX=clang++
+          else
+            export CC=gcc
+            export CXX=g++
+          fi
+
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_C_COMPILER=${CC} \
-            -DCMAKE_CXX_COMPILER=${CXX}
-        env:
-          CC: ${{ env.CC }}
-          CXX: ${{ env.CXX }}
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}"
 
       - name: Build
-        run: cmake --build build -- -j $(nproc)
+        run: cmake --build build --parallel
 
       - name: Run tests
+        shell: bash
         run: |
           if [ -f build/CTestTestfile.cmake ]; then
-            ctest --test-dir build --output-on-failure
+            ctest --test-dir build --output-on-failure --schedule-random
           else
             echo "No tests configured (no CTestTestfile.cmake found)"
           fi
