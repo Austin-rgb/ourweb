@@ -36,20 +36,27 @@ HttpMethod parse_method(std::string_view method) noexcept {
 
 std::string_view status_reason(HttpStatus status) noexcept {
     switch (status) {
+        case HttpStatus::Continue:              return "Continue";
         case HttpStatus::Ok:                    return "OK";
         case HttpStatus::Created:               return "Created";
         case HttpStatus::Accepted:              return "Accepted";
         case HttpStatus::NoContent:             return "No Content";
+        case HttpStatus::NotModified:           return "Not Modified";
         case HttpStatus::BadRequest:            return "Bad Request";
         case HttpStatus::Unauthorized:          return "Unauthorized";
         case HttpStatus::Forbidden:             return "Forbidden";
         case HttpStatus::NotFound:              return "Not Found";
         case HttpStatus::MethodNotAllowed:      return "Method Not Allowed";
+        case HttpStatus::RequestTimeout:        return "Request Timeout";
         case HttpStatus::RequestEntityTooLarge: return "Request Entity Too Large";
+        case HttpStatus::UriTooLong:            return "URI Too Long";
         case HttpStatus::UnsupportedMediaType:  return "Unsupported Media Type";
+        case HttpStatus::ExpectationFailed:     return "Expectation Failed";
+        case HttpStatus::RequestHeaderFieldsTooLarge: return "Request Header Fields Too Large";
         case HttpStatus::InternalServerError:   return "Internal Server Error";
         case HttpStatus::NotImplemented:        return "Not Implemented";
         case HttpStatus::ServiceUnavailable:    return "Service Unavailable";
+        case HttpStatus::HttpVersionNotSupported: return "HTTP Version Not Supported";
         default:                                return "Unknown";
     }
 }

@@ -40,3 +40,58 @@ TEST(Response, InvalidHeaderThrows) {
     EXPECT_THROW(r.header("Bad\nName", "value"), std::invalid_argument);
     EXPECT_THROW(r.header("Ok", "bad\r\nvalue"), std::invalid_argument);
 }
+
+// ---------------------------------------------------------------------------
+// Header casing and wire framing
+// ---------------------------------------------------------------------------
+
+#include "../src/response_writer.hpp"
+
+TEST(Response, HeaderReplacementIsCaseInsensitive) {
+    Response r;
+    r.header("content-type", "a/b").header("Content-Type", "c/d");
+    EXPECT_EQ(r.headers().size(), 1u);
+    EXPECT_EQ(r.headers().begin()->second, "c/d");
+    r.content_type("e/f");  // must not override an existing one
+    EXPECT_EQ(r.headers().begin()->second, "c/d");
+}
+
+namespace {
+bool contains(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
+}
+
+TEST(Serialize, ContentLengthAlwaysMatchesBodyAndAppHeadersCannotBreakFraming) {
+    Response r = text("hello");
+    r.header("Content-Length", "9999").header("transfer-encoding", "chunked").header("Connection", "keep-alive");
+    auto wire = serialize_response(r, false);
+    EXPECT_TRUE(contains(wire, "HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(contains(wire, "Content-Length: 5\r\n"));
+    EXPECT_FALSE(contains(wire, "9999"));
+    EXPECT_FALSE(contains(wire, "chunked"));
+    EXPECT_FALSE(contains(wire, "keep-alive"));
+    EXPECT_TRUE(contains(wire, "Connection: close\r\n\r\nhello"));
+}
+
+TEST(Serialize, HeadHasLengthButNoBody) {
+    auto wire = serialize_response(text("hello"), true);
+    EXPECT_TRUE(contains(wire, "Content-Length: 5\r\n"));
+    EXPECT_TRUE(wire.size() >= 4 && wire.substr(wire.size() - 4) == "\r\n\r\n");
+}
+
+TEST(Serialize, NoContentAndNotModifiedCarryNoBodyOrLength) {
+    for (auto st : {HttpStatus::NoContent, HttpStatus::NotModified}) {
+        Response r(st);
+        r.body("must not be sent");
+        auto wire = serialize_response(r, false);
+        EXPECT_FALSE(contains(wire, "Content-Length"));
+        EXPECT_FALSE(contains(wire, "must not"));
+    }
+}
+
+TEST(Serialize, InvalidStatusBecomes500) {
+    for (std::uint16_t code : {std::uint16_t{0}, std::uint16_t{99}, std::uint16_t{100}, std::uint16_t{600}, std::uint16_t{1000}}) {
+        Response r;
+        r.status(code);
+        EXPECT_TRUE(contains(serialize_response(r, false), "HTTP/1.1 500 "));
+    }
+}

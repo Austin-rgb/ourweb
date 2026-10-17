@@ -31,6 +31,17 @@ bool is_valid_header_value(std::string_view value) {
     return true;
 }
 
+bool iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 Response& Response::header(std::string name, std::string value) {
@@ -40,7 +51,16 @@ Response& Response::header(std::string name, std::string value) {
     if (!is_valid_header_value(value)) {
         throw std::invalid_argument("Invalid HTTP header value");
     }
-    // Store with original casing for name, but we could normalize
+    // Header names are case-insensitive: setting "content-type" must replace an
+    // existing "Content-Type" rather than emit both on the wire. The most
+    // recently supplied casing is kept.
+    for (auto it = headers_.begin(); it != headers_.end();) {
+        if (iequals(it->first, name)) {
+            it = headers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     headers_[std::move(name)] = std::move(value);
     return *this;
 }

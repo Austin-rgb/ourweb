@@ -11,6 +11,7 @@ option(OURWEB_BUILD_EXAMPLES "Build example applications" ON)
 option(OURWEB_BUILD_TESTS "Build tests" ON)
 option(OURWEB_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(OURWEB_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(OURWEB_ENABLE_TSAN "Enable ThreadSanitizer (cannot be combined with ASan)" OFF)
 
 # Compiler warnings
 if(MSVC)
@@ -24,8 +25,15 @@ if(OURWEB_ENABLE_ASAN)
     add_link_options(-fsanitize=address)
 endif()
 if(OURWEB_ENABLE_UBSAN)
-    add_compile_options(-fsanitize=undefined)
+    add_compile_options(-fsanitize=undefined -fno-sanitize-recover=undefined)
     add_link_options(-fsanitize=undefined)
+endif()
+if(OURWEB_ENABLE_TSAN)
+    if(OURWEB_ENABLE_ASAN)
+        message(FATAL_ERROR "OURWEB_ENABLE_TSAN cannot be combined with OURWEB_ENABLE_ASAN")
+    endif()
+    add_compile_options(-fsanitize=thread)
+    add_link_options(-fsanitize=thread)
 endif()
 
 # Dependencies via FetchContent
@@ -38,6 +46,7 @@ endif()
 
 # Networking: POSIX sockets used for the initial Linux scaffold.
 # Future versions will integrate standalone Asio or Boost.Asio.
+find_package(Threads REQUIRED)
 
 # nlohmann/json
 FetchContent_Declare(
@@ -68,6 +77,9 @@ add_library(ourweb
     src/router.cpp
     src/server.cpp
     src/http_parser.cpp
+    src/url.cpp
+    src/socket_io.cpp
+    src/response_writer.cpp
     src/middleware.cpp
     src/error.cpp
     src/http.cpp
@@ -86,14 +98,11 @@ target_include_directories(ourweb
 target_link_libraries(ourweb
     PUBLIC
         nlohmann_json::nlohmann_json
+        Threads::Threads
 )
 
-# Platform-specific libraries for Asio
-if(WIN32)
-    target_link_libraries(ourweb PUBLIC ws2_32 mswsock)
-elseif(UNIX AND NOT APPLE)
-    target_link_libraries(ourweb PUBLIC pthread)
-endif()
+# Note: the current networking layer uses POSIX sockets (Linux/macOS).
+# Windows support arrives with the planned Asio backend.
 
 # Examples
 if(OURWEB_BUILD_EXAMPLES)

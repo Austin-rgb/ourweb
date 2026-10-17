@@ -1,17 +1,23 @@
 #pragma once
 
+#include "ourweb/error.hpp"
+#include "ourweb/extractor.hpp"
+#include "ourweb/handler.hpp"
 #include "ourweb/http.hpp"
+#include "ourweb/json.hpp"
+#include "ourweb/middleware.hpp"
+#include "ourweb/path.hpp"
 #include "ourweb/request.hpp"
 #include "ourweb/response.hpp"
 #include "ourweb/router.hpp"
+#include "ourweb/server_options.hpp"
 #include "ourweb/state.hpp"
-#include "ourweb/middleware.hpp"
-#include "ourweb/json.hpp"
-#include "ourweb/path.hpp"
-#include "ourweb/error.hpp"
 #include "ourweb/version.hpp"
 
+#include <chrono>
 #include <concepts>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -22,8 +28,23 @@
 
 namespace ourweb {
 
-class Server; // forward
+namespace detail {
+struct RunState;
+}
 
+// The application: routes, middleware, state and the HTTP server.
+//
+// Threading model: configure the App (routes, middleware, state, options) on
+// one thread, then call run(). Handlers and middleware are invoked
+// concurrently from multiple connection threads, so they - and any state they
+// share - must be thread-safe. Configuration is frozen while the server runs:
+// registering a route/middleware/state or changing options then throws
+// std::logic_error (FR-01.7).
+//
+// Lifetime: run() blocks until stop(). When it returns, every connection
+// thread has been joined; nothing keeps running in the background. Destroying
+// an App that is running (from another thread) stops it and waits for run() to
+// return. Do not move a running App.
 class App {
 public:
     App();
@@ -35,6 +56,14 @@ public:
     App& operator=(App&&) noexcept;
 
     // --- Route registration -------------------------------------------------
+    //
+    // `handler` may be any supported handler signature (see ourweb/handler.hpp):
+    // Response(), Response(const Request&), Response(Request), or any mix of
+    // Request / Path<T> / Json<T> parameters.
+    //
+    // Throws RouteError for an invalid pattern, a duplicate route (same method
+    // and shape, even with different parameter names), or a handler with more
+    // Path<> parameters than the pattern has "{param}" segments.
 
     template <typename Handler>
     App& get(std::string path, Handler&& handler) {
@@ -69,7 +98,9 @@ public:
     // Generic route
     template <typename Handler>
     App& route(HttpMethod method, std::string path, Handler&& handler) {
-        router_.add(method, std::move(path), make_handler(std::forward<Handler>(handler)));
+        AdaptedHandler adapted = adapt_handler(std::forward<Handler>(handler));
+        ensure_configurable("register a route");
+        router_.add(method, std::move(path), std::move(adapted.fn), adapted.path_params);
         return *this;
     }
 
@@ -79,6 +110,7 @@ public:
     template <typename T>
         requires std::move_constructible<T>
     App& state(T value) {
+        ensure_configurable("register state");
         state_registry_.set(std::move(value));
         return *this;
     }
@@ -88,6 +120,7 @@ public:
     //   app.state(std::make_shared<AppState>());
     template <typename T>
     App& state(std::shared_ptr<T> ptr) {
+        ensure_configurable("register state");
         state_registry_.set(std::move(ptr));
         return *this;
     }
@@ -95,11 +128,13 @@ public:
     // Construct state in place: app.emplace_state<AppState>(args...)
     template <typename T, typename... Args>
     App& emplace_state(Args&&... args) {
+        ensure_configurable("register state");
         state_registry_.emplace<T>(std::forward<Args>(args)...);
         return *this;
     }
 
     // --- Middleware ---------------------------------------------------------
+    // Execution order and guarantees are documented in ourweb/middleware.hpp.
 
     App& wrap(std::shared_ptr<Middleware> mw);
     App& wrap(MiddlewareFn fn);
@@ -109,90 +144,59 @@ public:
 
     // --- Configuration ------------------------------------------------------
 
-    App& max_body_size(std::size_t bytes) {
-        max_body_size_ = bytes;
-        return *this;
-    }
+    // Replace all server options (limits and timeouts).
+    App& options(ServerOptions opts);
+    [[nodiscard]] const ServerOptions& options() const noexcept { return options_; }
 
-    [[nodiscard]] std::size_t max_body_size() const noexcept { return max_body_size_; }
+    // Shortcut for options().max_body_size (default 1 MiB; larger -> 413).
+    App& max_body_size(std::size_t bytes);
+    [[nodiscard]] std::size_t max_body_size() const noexcept { return options_.max_body_size; }
 
     // --- Lifecycle ----------------------------------------------------------
 
-    // Bind and run the server. Blocks until shutdown.
-    // address format: "127.0.0.1:8080" or "0.0.0.0:8080"
+    // Bind and run the server. Blocks until stop(); on return all connection
+    // threads have been joined. address: "127.0.0.1:8080", "0.0.0.0:8080",
+    // "localhost:8080", "[::1]:8080"; port 0 picks a free port (see
+    // local_port()). Throws std::runtime_error with a descriptive message when
+    // the address is invalid or cannot be bound, std::logic_error if already
+    // running.
     void run(std::string_view address);
 
-    // Request graceful shutdown (can be called from another thread / signal)
+    // Request graceful shutdown of a running server; no-op if not running.
+    // Thread-safe, idempotent, and safe to call from a handler. NOT
+    // async-signal-safe: from a signal handler, set a flag and call stop() from
+    // a normal thread. In-flight requests finish (see ServerOptions::
+    // shutdown_grace); new connections are refused.
     void stop();
 
-    // Internal: process a single request (used by Server)
+    // True between the start and the end of run().
+    [[nodiscard]] bool is_running() const;
+    // Port the running server is bound to (0 if not running).
+    [[nodiscard]] std::uint16_t local_port() const;
+    // Block until the server is accepting connections. Returns false on
+    // timeout, or if run() failed or ended first. Handy for tests:
+    //   std::thread t([&] { app.run("127.0.0.1:0"); });
+    //   app.wait_until_ready(std::chrono::seconds(5));
+    bool wait_until_ready(std::chrono::milliseconds timeout = std::chrono::seconds(5));
+
+    // Process one request through routing, middleware and the handler. Never
+    // throws; handler/middleware exceptions become 500 responses. Used by the
+    // server and by in-process tests.
     [[nodiscard]] Response handle_request(Request req) const;
 
     [[nodiscard]] const StateRegistry& state_registry() const noexcept { return state_registry_; }
     [[nodiscard]] StateRegistry& state_registry() noexcept { return state_registry_; }
 
 private:
-    // Handler adaptation: turn various callable signatures into HandlerFn
-    template <typename Handler>
-    HandlerFn make_handler(Handler&& h);
-
-    // Specializations / overloads for common signatures are implemented via
-    // SFINAE / if constexpr in the .cpp-friendly way, but since templates
-    // must be in header we put the logic here.
+    void ensure_configurable(const char* what) const;
 
     Router router_;
     StateRegistry state_registry_;
     std::vector<std::shared_ptr<Middleware>> middlewares_;
-    std::size_t max_body_size_ = 1024 * 1024; // 1 MiB default
-    std::unique_ptr<Server> server_;
+    ServerOptions options_;
+    // Shared (not unique) so the thread inside run() can keep it alive until it
+    // has finished touching it, even if ~App() has already been released.
+    std::shared_ptr<detail::RunState> run_;
 };
-
-// ---------------------------------------------------------------------------
-// Handler adaptation helpers (header-only for template flexibility)
-// ---------------------------------------------------------------------------
-
-namespace detail {
-
-// Detect if callable takes zero arguments
-template <typename F>
-concept ZeroArg = requires(F f) {
-    { f() } -> std::convertible_to<Response>;
-};
-
-template <typename F>
-concept RequestArg = requires(F f, Request r) {
-    { f(std::move(r)) } -> std::convertible_to<Response>;
-};
-
-} // namespace detail
-
-template <typename Handler>
-HandlerFn App::make_handler(Handler&& h) {
-    using H = std::decay_t<Handler>;
-
-    // Case 1: zero-argument handler returning Response
-    if constexpr (detail::ZeroArg<H>) {
-        return [handler = std::forward<Handler>(h)](Request) -> Response {
-            return handler();
-        };
-    }
-    // Case 2: single Request argument
-    else if constexpr (detail::RequestArg<H>) {
-        return [handler = std::forward<Handler>(h)](Request req) -> Response {
-            return handler(std::move(req));
-        };
-    }
-    // Anything already usable as Response(Request) (e.g. a std::function)
-    else if constexpr (std::is_constructible_v<HandlerFn, Handler>) {
-        return HandlerFn(std::forward<Handler>(h));
-    }
-    else {
-        static_assert(detail::ZeroArg<H> || detail::RequestArg<H>,
-                      "ourweb: unsupported handler signature. Handlers must be "
-                      "callable as Response() or Response(Request), and must "
-                      "not be generic lambdas or overload sets.");
-        return {};
-    }
-}
 
 } // namespace ourweb
