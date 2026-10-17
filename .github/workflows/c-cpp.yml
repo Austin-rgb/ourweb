@@ -1,0 +1,45 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache CMake deps
+  uses: actions/cache@v4
+  with:
+    path: |
+      build/_deps
+      build/CMakeFiles
+    key: ${{ runner.os }}-cmake-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt') }}
+
+- name: Install system packages
+  run: |
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cmake build-essential ninja-build pkg-config
+    if [ "${{ matrix.compiler }}" = "clang" ]; then sudo apt-get install -y clang; fi
+
+- name: Configure (CMake)
+  run: |
+    set -euo pipefail
+    if [ "${{ matrix.compiler }}" = "clang" ]; then
+      COMPILER_FLAGS="-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++"
+    else
+      COMPILER_FLAGS=""
+    fi
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DOURWEB_BUILD_TESTS=ON $COMPILER_FLAGS
+
+- name: Build
+  run: cmake --build build -- -j$(nproc)
+
+- name: Run tests
+  run: |
+    ctest --test-dir build --output-on-failure -j1
